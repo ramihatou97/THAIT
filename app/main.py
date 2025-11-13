@@ -8,7 +8,7 @@ from typing import List, Optional
 from datetime import datetime
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, status
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -79,8 +79,9 @@ app.add_middleware(
 )
 
 # Include routers
-from app.routes import graph as graph_routes
+from app.routes import graph as graph_routes, search as search_routes
 app.include_router(graph_routes.router)
+app.include_router(search_routes.router)
 
 
 # =============================================================================
@@ -125,15 +126,17 @@ async def readiness_check():
 async def extract_facts(
     text: str,
     patient_id: int,
-    document_id: int
+    document_id: int,
+    use_cache: bool = Query(True, description="Use cached results if available")
 ):
     """
-    Extract clinical facts from text
+    Extract clinical facts from text with optional caching
 
     Args:
         text: Clinical text to extract from
         patient_id: Patient ID
         document_id: Document ID
+        use_cache: Whether to use cached results (default: True)
 
     Returns:
         List of extracted atomic clinical facts
@@ -141,9 +144,25 @@ async def extract_facts(
     try:
         logger.info(f"Extracting facts for patient {patient_id}, document {document_id}")
 
-        facts = extract_clinical_facts(text, patient_id, document_id)
+        # Try cache first
+        if use_cache:
+            from app.services.cache_service import get_cached_facts, cache_facts
+            cached = get_cached_facts(document_id)
 
+            if cached:
+                # Convert cached dicts back to AtomicClinicalFact objects
+                facts = [AtomicClinicalFact(**f) for f in cached]
+                logger.info(f"✓ Cache HIT: Returning {len(facts)} cached facts")
+                return facts
+
+        # Cache miss or cache disabled - perform extraction
+        facts = extract_clinical_facts(text, patient_id, document_id)
         logger.info(f"Extracted {len(facts)} facts")
+
+        # Cache results for future requests
+        if use_cache:
+            from app.services.cache_service import cache_facts
+            cache_facts(document_id, facts)
 
         return facts
 
