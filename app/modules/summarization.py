@@ -7,12 +7,26 @@ import logging
 from typing import List, Dict, Optional, Any
 from datetime import datetime
 import json
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.schemas import (
     AtomicClinicalFact, EntityType, SummaryRequest, SummaryResponse,
     SummarySection, ClinicalAlert
 )
 from app.config import settings
+
+# Conditional imports for LLM providers
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -374,44 +388,154 @@ class SectionGenerator:
 class LLMSummarizer:
     """LLM-based summarization for narrative generation"""
 
-    @staticmethod
-    def generate_narrative_summary(
+    def __init__(self):
+        self.provider = settings.llm_provider
+        self.openai_client = None
+        self.anthropic_client = None
+
+        if OPENAI_AVAILABLE and settings.openai_api_key:
+            try:
+                self.openai_client = openai.OpenAI(api_key=settings.openai_api_key)
+                logger.info("OpenAI client initialized for summarization")
+            except Exception as e:
+                logger.error(f"Failed to initialize OpenAI client: {e}")
+
+        if ANTHROPIC_AVAILABLE and settings.anthropic_api_key:
+            try:
+                self.anthropic_client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+                logger.info("Anthropic client initialized for summarization")
+            except Exception as e:
+                logger.error(f"Failed to initialize Anthropic client: {e}")
+
+        if not self.openai_client and not self.anthropic_client:
+            logger.warning("No LLM API clients initialized - narrative generation disabled")
+
+    def _get_summary_prompt(
+        self,
         facts: List[AtomicClinicalFact],
         summary_type: str,
         patient_context: Dict
     ) -> str:
-        """
-        Generate narrative summary using LLM
+        """Generate prompt for narrative summary"""
+        # Organize facts by type
+        facts_by_type = {}
+        for fact in facts:
+            if fact.entity_type not in facts_by_type:
+                facts_by_type[fact.entity_type] = []
+            facts_by_type[fact.entity_type] = [f.entity_name for f in facts if f.entity_type == fact.entity_type]
 
-        Args:
-            facts: List of clinical facts
-            summary_type: Type of summary to generate
-            patient_context: Patient context information
+        pod = patient_context.get('pod', 'N/A')
 
-        Returns:
-            Narrative summary text
-        """
-        # TODO: Implement LLM-based narrative generation
-        # This would call OpenAI/Anthropic API with structured facts
-        # and generate coherent narrative
+        return f"""You are a senior neurosurgical attending physician writing a {summary_type.replace('_', ' ')}.
 
-        logger.info("LLM narrative generation not yet implemented")
-        return "Narrative summary generation pending LLM integration"
+Generate a concise, professional narrative "Hospital Course" section based ONLY on these extracted clinical facts:
 
-    @staticmethod
-    def enhance_section(section_text: str, context: str) -> str:
-        """
-        Enhance section with LLM for better readability
+Diagnoses: {', '.join(facts_by_type.get(EntityType.DIAGNOSIS, []))}
+Procedures: {', '.join(facts_by_type.get(EntityType.PROCEDURE, []))}
+Medications: {', '.join(facts_by_type.get(EntityType.MEDICATION, []))}
+Physical Exam: {', '.join([f.entity_name for f in facts if f.entity_type == EntityType.PHYSICAL_EXAM])}
+Labs: {', '.join([f.entity_name for f in facts if f.entity_type == EntityType.LAB_VALUE])}
 
-        Args:
-            section_text: Raw section text
-            context: Additional context
+Post-operative Day: {pod}
 
-        Returns:
-            Enhanced section text
-        """
-        # TODO: Implement LLM enhancement
-        logger.info("LLM section enhancement not yet implemented")
+Chronological Facts:
+{json.dumps([{'day': f.temporal_context.get('pod') if f.temporal_context else None, 'type': f.entity_type.value, 'entity': f.entity_name} for f in sorted(facts, key=lambda x: (x.temporal_context.get('pod') if x.temporal_context and x.temporal_context.get('pod') else 999), reverse=False)], indent=2)}
+
+Write a 2-3 paragraph narrative hospital course that:
+1. Flows chronologically by POD
+2. Integrates facts naturally
+3. Is professional and concise
+4. Uses only information from the facts above
+5. Follows neurosurgical documentation standards
+
+Hospital Course:"""
+
+    @retry(
+        stop=stop_after_attempt(settings.llm_max_retries),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    def _call_openai(self, prompt: str) -> str:
+        """Call OpenAI API with retry logic"""
+        if not self.openai_client:
+            return "OpenAI client not configured."
+
+        try:
+            response = self.openai_client.chat.completions.create(
+                model=settings.openai_model,
+                messages=[
+                    {"role": "system", "content": "You are a senior neurosurgical attending physician writing clinical summaries."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=settings.openai_temperature,
+                max_tokens=settings.openai_max_tokens,
+                timeout=settings.llm_timeout
+            )
+            return response.choices[0].message.content or ""
+
+        except Exception as e:
+            logger.error(f"OpenAI API call failed: {e}")
+            raise
+
+    @retry(
+        stop=stop_after_attempt(settings.llm_max_retries),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    def _call_anthropic(self, prompt: str) -> str:
+        """Call Anthropic API with retry logic"""
+        if not self.anthropic_client:
+            return "Anthropic client not configured."
+
+        try:
+            response = self.anthropic_client.messages.create(
+                model=settings.anthropic_model,
+                system="You are a senior neurosurgical attending physician writing clinical summaries.",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=settings.anthropic_temperature,
+                max_tokens=settings.anthropic_max_tokens,
+                timeout=settings.llm_timeout
+            )
+            return response.content[0].text or ""
+
+        except Exception as e:
+            logger.error(f"Anthropic API call failed: {e}")
+            raise
+
+    def generate_narrative_summary(
+        self,
+        facts: List[AtomicClinicalFact],
+        summary_type: str,
+        patient_context: Dict
+    ) -> str:
+        """Generate narrative summary using LLM"""
+        if not settings.extraction_use_llm or (not self.openai_client and not self.anthropic_client):
+            logger.warning("LLM summarization disabled - no API keys configured")
+            return "(LLM narrative generation is disabled. Configure API keys in .env to enable.)"
+
+        logger.info(f"Generating LLM narrative for {summary_type}...")
+        prompt = self._get_summary_prompt(facts, summary_type, patient_context)
+
+        try:
+            # Try primary provider
+            if self.provider == "openai" and self.openai_client:
+                return self._call_openai(prompt)
+            elif self.provider == "anthropic" and self.anthropic_client:
+                return self._call_anthropic(prompt)
+            # Try fallback
+            elif settings.llm_fallback_provider == "openai" and self.openai_client:
+                logger.warning(f"Primary provider unavailable, using fallback OpenAI")
+                return self._call_openai(prompt)
+            elif settings.llm_fallback_provider == "anthropic" and self.anthropic_client:
+                logger.warning(f"Primary provider unavailable, using fallback Anthropic")
+                return self._call_anthropic(prompt)
+            else:
+                return "(No valid LLM provider configured.)"
+
+        except Exception as e:
+            logger.error(f"LLM summarization failed after retries: {e}")
+            return f"(Error generating summary: {str(e)})"
+
+    def enhance_section(self, section_text: str, context: str) -> str:
+        """Enhance section with LLM (placeholder for future use)"""
         return section_text
 
 
@@ -519,6 +643,22 @@ class SummarizationEngine:
             content=labs_imaging_text,
             section_type="labs_imaging"
         ))
+
+        # Generate LLM narrative (if enabled and discharge summary)
+        if settings.extraction_use_llm and request.summary_type == "discharge_summary":
+            logger.info("Generating narrative hospital course via LLM...")
+            patient_context = request.patient_context or patient_data or {}
+            narrative_course = self.llm_summarizer.generate_narrative_summary(
+                facts_by_timeline,  # Give chronologically ordered facts
+                request.summary_type,
+                patient_context
+            )
+            sections.append(SummarySection(
+                title="Hospital Course Narrative",
+                content=narrative_course,
+                section_type="narrative",
+                facts_count=len(facts_by_timeline)
+            ))
 
         # Clinical Alerts (if any)
         if alerts:

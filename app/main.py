@@ -317,31 +317,32 @@ async def build_timeline(
 # =============================================================================
 
 @app.post("/api/v1/summarize", response_model=SummaryResponse, tags=["summarization"])
-async def generate_summary(
-    request: SummaryRequest,
-    facts: List[AtomicClinicalFact],
-    alerts: Optional[List[ClinicalAlert]] = None,
-    patient_data: Optional[dict] = None
-):
+async def generate_summary(request: SummaryRequest):
     """
     Generate clinical summary from extracted facts
 
-    Args:
-        request: Summary request with preferences
-        facts: List of clinical facts
-        alerts: Optional clinical alerts
-        patient_data: Optional patient demographic data
+    The SummaryRequest should contain:
+    - facts: List of clinical facts
+    - alerts: Optional clinical alerts
+    - patient_data: Optional patient demographic data
+    - patient_context: Optional context (e.g., POD)
 
     Returns:
         Generated clinical summary
     """
     try:
-        logger.info(f"Generating {request.summary_type} summary for patient {request.patient_id}")
+        patient_id = request.patient_id or request.patient_mrn
+        logger.info(f"Generating {request.summary_type} summary for patient {patient_id}")
 
-        summary = generate_clinical_summary(request, facts, alerts, patient_data)
+        # Use embedded data from request
+        summary = generate_clinical_summary(
+            request=request,
+            facts=request.facts,
+            alerts=request.alerts,
+            patient_data=request.patient_data
+        )
 
         logger.info(f"Summary generated: {len(summary.sections)} sections")
-
         return summary
 
     except Exception as e:
@@ -399,14 +400,31 @@ async def complete_pipeline(
 
         # Step 4: Summarization
         logger.info("Step 4: Generating clinical summary...")
+
+        # Ensure patient_data has MRN
+        patient_data = patient_data or {}
+        patient_data.setdefault("mrn", str(patient_id))
+
+        # Build complete SummaryRequest with all aggregated data
         summary_request = SummaryRequest(
+            patient_mrn=str(patient_id),
             patient_id=patient_id,
             summary_type=summary_type,
             format="markdown",
             include_alerts=True,
-            include_timeline=True
+            include_timeline=True,
+            facts=facts,  # Embed extracted facts
+            alerts=alerts,  # Embed alerts
+            patient_data=patient_data,  # Embed patient data
+            patient_context=patient_context or {}  # Embed context
         )
-        summary = generate_clinical_summary(summary_request, facts, alerts, patient_data)
+
+        summary = generate_clinical_summary(
+            request=summary_request,
+            facts=facts,
+            alerts=alerts,
+            patient_data=patient_data
+        )
         logger.info(f"Summary generated with {len(summary.sections)} sections")
 
         # Compile results

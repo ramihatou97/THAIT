@@ -503,29 +503,59 @@ class SummarySection(BaseModel):
     """Section of a clinical summary"""
     title: str
     content: str
+    section_type: Optional[str] = None
     facts_count: int = 0
 
 
 class SummaryRequest(BaseModel):
-    """Request for summary generation"""
+    """Request for summary generation - contains all data for the summarization job"""
     patient_mrn: str
+    patient_id: Optional[int] = None
     summary_type: Literal["discharge_summary", "progress_note", "procedure_note"] = "discharge_summary"
+    format: Literal["markdown", "json", "structured"] = "markdown"
     include_timeline: bool = True
     include_references: bool = True
+    include_alerts: bool = True
     max_length: Optional[int] = Field(None, ge=500, le=10000)
+
+    # Embedded data for summarization
+    facts: List["AtomicClinicalFact"] = Field(default_factory=list)
+    alerts: Optional[List["ClinicalAlert"]] = Field(default_factory=list)
+    patient_data: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    patient_context: Optional[Dict[str, Any]] = Field(default_factory=dict)
 
 
 class SummaryResponse(BaseModel):
     """Generated summary with metadata"""
-    summary_text: str
+    patient_id: int
     summary_type: str
-    generated_at: datetime = Field(default_factory=datetime.utcnow)
+    summary_text: str
+    sections: List[SummarySection] = Field(default_factory=list)
+    facts_included: int
+    generation_timestamp: datetime = Field(default_factory=datetime.utcnow)
     confidence_score: float = Field(0.0, ge=0.0, le=1.0)
-    word_count: int
-    verified_claims_count: int
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    # Legacy fields for compatibility
+    generated_at: Optional[datetime] = None
+    word_count: Optional[int] = None
+    verified_claims_count: Optional[int] = None
     unverified_claims: List[str] = Field(default_factory=list)
     safety_warnings: List[str] = Field(default_factory=list)
     missing_critical_data: List[str] = Field(default_factory=list)
+
+    @field_validator("generated_at", mode="before")
+    @classmethod
+    def set_generated_at(cls, v, info):
+        return v or info.data.get("generation_timestamp") or datetime.utcnow()
+
+    @field_validator("word_count", mode="before")
+    @classmethod
+    def calculate_word_count(cls, v, info):
+        if v is not None:
+            return v
+        summary_text = info.data.get("summary_text", "")
+        return len(summary_text.split()) if summary_text else 0
 
 
 # ============================================================================

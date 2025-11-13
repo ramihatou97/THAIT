@@ -5,12 +5,14 @@ Hybrid NER + LLM + Rule-based extraction for 95%+ recall
 
 import re
 import logging
+import json
 from typing import List, Dict, Optional, Tuple, Any
 from datetime import datetime
 import spacy
 from spacy.tokens import Doc, Span
 import scispacy
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.schemas import (
     AtomicClinicalFact, EntityType, Laterality, BrainRegion,
@@ -20,7 +22,231 @@ from app.schemas import (
 )
 from app.config import settings
 
+# Conditional imports for LLM providers
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    logger.warning("OpenAI library not available")
+
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+    logger.warning("Anthropic library not available")
+
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# LLM Extraction Client
+# =============================================================================
+
+class LLMExtractionClient:
+    """Handles communication with OpenAI and Anthropic for extraction"""
+
+    def __init__(self):
+        self.provider = settings.llm_provider
+        self.openai_client = None
+        self.anthropic_client = None
+
+        if OPENAI_AVAILABLE and settings.openai_api_key:
+            try:
+                self.openai_client = openai.OpenAI(api_key=settings.openai_api_key)
+                logger.info("OpenAI client initialized for extraction")
+            except Exception as e:
+                logger.error(f"Failed to initialize OpenAI client: {e}")
+
+        if ANTHROPIC_AVAILABLE and settings.anthropic_api_key:
+            try:
+                self.anthropic_client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+                logger.info("Anthropic client initialized for extraction")
+            except Exception as e:
+                logger.error(f"Failed to initialize Anthropic client: {e}")
+
+        if not self.openai_client and not self.anthropic_client:
+            logger.warning("No LLM API clients initialized - LLM extraction disabled")
+
+    def _get_extraction_prompt(self, text: str, entity_types: List[EntityType]) -> str:
+        """Generate extraction prompt for LLM"""
+        schema_example = {
+            "entity_type": "DIAGNOSIS",
+            "entity_name": "Glioblastoma multiforme",
+            "extracted_text": "newly diagnosed glioblastoma",
+            "anatomical_context": {
+                "laterality": "left",
+                "brain_region": "frontal"
+            },
+            "is_negated": False,
+            "is_historical": False
+        }
+
+        entity_types_str = ", ".join([et.value for et in entity_types])
+
+        return f"""You are a specialized medical extraction AI for neurosurgery clinical notes.
+
+Analyze the following clinical text and extract ALL entities matching these types: {entity_types_str}
+
+Return ONLY a valid JSON array [...] where each object matches this schema:
+{json.dumps(schema_example, indent=2)}
+
+Requirements:
+- "entity_type" must be one of: {entity_types_str}
+- "entity_name" should be the normalized, canonical medical term
+- "extracted_text" must be the exact text from the document
+- "anatomical_context" should include laterality and brain_region when applicable
+- "is_negated" = true if entity is explicitly denied (e.g., "no hemorrhage")
+- "is_historical" = true if from past medical history
+
+Return empty array [] if no entities found.
+
+Clinical Text:
+---
+{text}
+---
+
+JSON Array:"""
+
+    @retry(
+        stop=stop_after_attempt(settings.llm_max_retries),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    def _call_openai(self, prompt: str) -> str:
+        """Call OpenAI API with retry logic"""
+        if not self.openai_client:
+            return "[]"
+
+        try:
+            response = self.openai_client.chat.completions.create(
+                model=settings.openai_model,
+                messages=[
+                    {"role": "system", "content": "You are a medical extraction AI. Return ONLY valid JSON array, no other text."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=settings.openai_temperature,
+                max_tokens=settings.openai_max_tokens,
+                timeout=settings.llm_timeout
+            )
+            content = response.choices[0].message.content or "[]"
+
+            # Extract JSON array from response
+            json_match = re.search(r'\[.*\]', content, re.DOTALL)
+            if json_match:
+                return json_match.group(0)
+            return content
+
+        except Exception as e:
+            logger.error(f"OpenAI API call failed: {e}")
+            raise
+
+    @retry(
+        stop=stop_after_attempt(settings.llm_max_retries),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    def _call_anthropic(self, prompt: str) -> str:
+        """Call Anthropic API with retry logic"""
+        if not self.anthropic_client:
+            return "[]"
+
+        try:
+            response = self.anthropic_client.messages.create(
+                model=settings.anthropic_model,
+                system="You are a medical extraction AI. Return ONLY a valid JSON array [...], no other text.",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=settings.anthropic_temperature,
+                max_tokens=settings.anthropic_max_tokens,
+                timeout=settings.llm_timeout
+            )
+            content = response.content[0].text
+
+            # Extract JSON array from response
+            json_match = re.search(r'\[.*\]', content, re.DOTALL)
+            if json_match:
+                return json_match.group(0)
+
+            logger.warning(f"No JSON array found in Anthropic response: {content[:200]}")
+            return "[]"
+
+        except Exception as e:
+            logger.error(f"Anthropic API call failed: {e}")
+            raise
+
+    def extract_with_llm(self, text: str, entity_types: List[EntityType]) -> List[AtomicClinicalFact]:
+        """Extract entities using LLM"""
+        if not settings.extraction_use_llm or (not self.openai_client and not self.anthropic_client):
+            return []
+
+        logger.info(f"Using LLM for extraction of: {[e.value for e in entity_types]}")
+        prompt = self._get_extraction_prompt(text, entity_types)
+
+        json_response = "[]"
+        try:
+            # Try primary provider
+            if self.provider == "openai" and self.openai_client:
+                json_response = self._call_openai(prompt)
+            elif self.provider == "anthropic" and self.anthropic_client:
+                json_response = self._call_anthropic(prompt)
+            # Try fallback if primary failed
+            elif settings.llm_fallback_provider == "openai" and self.openai_client:
+                logger.warning(f"Primary provider {self.provider} unavailable, using fallback OpenAI")
+                json_response = self._call_openai(prompt)
+            elif settings.llm_fallback_provider == "anthropic" and self.anthropic_client:
+                logger.warning(f"Primary provider {self.provider} unavailable, using fallback Anthropic")
+                json_response = self._call_anthropic(prompt)
+
+        except Exception as e:
+            logger.error(f"LLM extraction failed after retries: {e}")
+            return []
+
+        # Parse JSON response into AtomicClinicalFact objects
+        facts = []
+        try:
+            extracted_data = json.loads(json_response)
+            if not isinstance(extracted_data, list):
+                logger.error(f"LLM returned non-list: {type(extracted_data)}")
+                return []
+
+            for item in extracted_data:
+                if not isinstance(item, dict):
+                    continue
+
+                if 'entity_type' in item and 'entity_name' in item and 'extracted_text' in item:
+                    # Find position in text
+                    char_start = text.find(item['extracted_text'])
+                    char_end = char_start + len(item['extracted_text']) if char_start != -1 else None
+
+                    # Get context snippet
+                    snippet_start = max(0, char_start - 50) if char_start != -1 else 0
+                    snippet_end = min(len(text), char_end + 50) if char_end else 100
+                    snippet = text[snippet_start:snippet_end]
+
+                    facts.append(
+                        AtomicClinicalFact(
+                            entity_type=item['entity_type'],
+                            entity_name=item['entity_name'],
+                            extracted_text=item['extracted_text'],
+                            source_snippet=snippet,
+                            confidence_score=0.92,  # LLM confidence
+                            extraction_method="llm",
+                            anatomical_context=item.get('anatomical_context'),
+                            is_negated=item.get('is_negated', False),
+                            is_historical=item.get('is_historical', False),
+                            char_start=char_start if char_start != -1 else None,
+                            char_end=char_end
+                        )
+                    )
+
+            logger.info(f"LLM extracted {len(facts)} facts")
+            return facts
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to decode LLM JSON: {e}. Response: {json_response[:200]}")
+            return []
+        except Exception as e:
+            logger.error(f"Error parsing LLM response: {e}")
+            return []
 
 
 # =============================================================================
@@ -686,6 +912,9 @@ class HybridExtractionEngine:
         if not self.ner_models.loaded:
             self.ner_models.load_models()
 
+        # Initialize LLM client for enhanced extraction
+        self.llm_client = LLMExtractionClient()
+
     def extract_all_facts(self, text: str, patient_id: int, document_id: int) -> List[AtomicClinicalFact]:
         """
         Extract all clinical facts from text using hybrid approach
@@ -739,19 +968,29 @@ class HybridExtractionEngine:
             all_facts.extend(motor_facts)
             logger.info(f"Extracted {len(motor_facts)} motor exam findings")
 
-            # 7. Add temporal context to all facts
-            for fact in all_facts:
-                temporal_context = TemporalExtractor.extract_temporal_context(
-                    text, fact.char_start or 0, fact.char_end or 0
+            # 7. Use LLM for complex entities (symptoms, findings, complications)
+            if settings.extraction_use_llm:
+                llm_facts = self.llm_client.extract_with_llm(
+                    text,
+                    [EntityType.SYMPTOM, EntityType.IMAGING_FINDING, EntityType.COMPLICATION]
                 )
-                if temporal_context:
-                    fact.temporal_context = temporal_context.dict()
+                all_facts.extend(llm_facts)
+                logger.info(f"Extracted {len(llm_facts)} facts via LLM")
 
-            # 8. Deduplicate facts
+            # 8. Add temporal context to all facts
+            for fact in all_facts:
+                if not fact.temporal_context:  # Don't overwrite if LLM provided it
+                    temporal_context = TemporalExtractor.extract_temporal_context(
+                        text, fact.char_start or 0, fact.char_end or 0
+                    )
+                    if temporal_context:
+                        fact.temporal_context = temporal_context.dict()
+
+            # 9. Deduplicate facts
             deduplicated_facts = self._deduplicate_facts(all_facts)
             logger.info(f"After deduplication: {len(deduplicated_facts)} facts")
 
-            # 9. Filter by confidence threshold
+            # 10. Filter by confidence threshold
             high_confidence_facts = [
                 f for f in deduplicated_facts
                 if f.confidence_score >= settings.extraction_min_confidence
