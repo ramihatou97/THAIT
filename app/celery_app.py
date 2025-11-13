@@ -23,6 +23,8 @@ celery_app = Celery(
         "app.tasks.extraction",
         "app.tasks.summarization",
         "app.tasks.validation",
+        "app.tasks.graph_sync",
+        "app.tasks.embeddings",
     ]
 )
 
@@ -49,6 +51,8 @@ celery_app.conf.task_routes = {
     "app.tasks.extraction.*": {"queue": "extraction"},
     "app.tasks.summarization.*": {"queue": "summarization"},
     "app.tasks.validation.*": {"queue": "validation"},
+    "app.tasks.graph_sync.*": {"queue": "graph"},
+    "app.tasks.embeddings.*": {"queue": "embeddings"},
 }
 
 logger.info("Celery application configured successfully")

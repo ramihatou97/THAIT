@@ -178,38 +178,77 @@ async def extract_facts(
 async def extract_from_file(
     file: UploadFile = File(...),
     patient_id: int = 1,
-    document_id: int = 1
+    document_id: int = 1,
+    use_cache: bool = Query(True, description="Use cached results"),
+    auto_index: bool = Query(True, description="Automatically index for vector search")
 ):
     """
-    Extract clinical facts from uploaded file
+    Extract clinical facts from uploaded file (PDF, DOCX, TXT)
+
+    Supports:
+    - PDF documents (with OCR for scanned files)
+    - Microsoft Word DOCX
+    - Plain text files
+
+    Features:
+    - Automatic document parsing
+    - Optional caching for performance
+    - Automatic vector indexing for semantic search
 
     Args:
-        file: Uploaded text file
+        file: Uploaded file
         patient_id: Patient ID
         document_id: Document ID
+        use_cache: Use cached results if available
+        auto_index: Automatically generate embeddings for search
 
     Returns:
         List of extracted atomic clinical facts
     """
     try:
+        logger.info(f"Processing file upload: {file.filename} (type: {file.content_type})")
+
+        # Check cache first
+        if use_cache:
+            from app.services.cache_service import get_cached_facts
+            cached = get_cached_facts(document_id)
+
+            if cached:
+                facts = [AtomicClinicalFact(**f) for f in cached]
+                logger.info(f"✓ Cache HIT: Returning {len(facts)} cached facts from file")
+                return facts
+
         # Read file content
         content = await file.read()
-        text = content.decode('utf-8')
 
-        logger.info(f"Extracting from file: {file.filename} ({len(text)} chars)")
+        # Parse document using comprehensive parser
+        from app.services.document_parser import parse_file
+        parsed = parse_file(content, file.filename, file.content_type)
+
+        text = parsed["text"]
+        logger.info(f"✓ File parsed: {file.filename} ({parsed['format']}, "
+                   f"{parsed.get('page_count', 1)} pages, {len(text)} chars)")
 
         # Extract facts
         facts = extract_clinical_facts(text, patient_id, document_id)
-
         logger.info(f"Extracted {len(facts)} facts from file")
+
+        # Cache results
+        if use_cache:
+            from app.services.cache_service import cache_facts
+            cache_facts(document_id, facts)
+
+        # Trigger async vector indexing
+        if auto_index and len(text) > 100:
+            try:
+                from app.tasks.embeddings import generate_document_embeddings_task
+                task = generate_document_embeddings_task.delay(document_id, text)
+                logger.info(f"✓ Async embedding generation queued: task {task.id}")
+            except Exception as e:
+                logger.warning(f"Failed to queue embedding task: {e}")
 
         return facts
 
-    except UnicodeDecodeError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="File must be UTF-8 encoded text"
-        )
     except Exception as e:
         logger.error(f"Error extracting from file: {e}", exc_info=True)
         raise HTTPException(
