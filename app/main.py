@@ -78,6 +78,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Include routers
+from app.routes import graph as graph_routes
+app.include_router(graph_routes.router)
+
 
 # =============================================================================
 # Health Check Endpoints
